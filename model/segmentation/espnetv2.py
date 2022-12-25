@@ -8,10 +8,11 @@ from torch.nn import init
 from nn_layers.espnet_utils import *
 from nn_layers.efficient_pyramid_pool import EfficientPyrPool
 from nn_layers.efficient_pt import EfficientPWConv
+from nn_layers.cosine_based_metrics import ArcMarginProduct
 from model.classification.espnetv2 import EESPNet
 from utilities.print_utils import *
 from torch.nn import functional as F
-
+from typing import Optional
 
 class ESPNetv2Segmentation(nn.Module):
     """
@@ -41,6 +42,7 @@ class ESPNetv2Segmentation(nn.Module):
         # =============================================================
         dec_feat_dict = {"pascal": 16, "city": 16, "coco": 32}
         base_dec_planes = dec_feat_dict[dataset]
+        self.dim_size = base_dec_planes
         dec_planes = [
             4 * base_dec_planes,
             3 * base_dec_planes,
@@ -63,17 +65,36 @@ class ESPNetv2Segmentation(nn.Module):
             proj_planes=pyr_plane_proj,
             out_planes=dec_planes[2],
         )
+
         self.bu_dec_l4 = EfficientPyrPool(
             in_planes=dec_planes[2],
             proj_planes=pyr_plane_proj,
             out_planes=dec_planes[3],
             last_layer_br=False,
+            normalize=False,
+            only_feat=True,
         )
-
+        if args.use_cosine:   
+            self.main_classifier = ArcMarginProduct(
+                in_features=self.dim_size,
+                out_features=classes,
+                s=args.cos_logit_scale,
+                m=args.cos_margin,
+                easy_margin=args.is_easy_margin,
+            )
+        else:
+            self.main_classifier = nn.Conv2d(
+                self.dim_size, 
+                classes, 
+                kernel_size=1, 
+                stride=1, 
+                bias=False
+            )
+    
         self.merge_enc_dec_l2 = EfficientPWConv(config[2], dec_planes[0])
         self.merge_enc_dec_l3 = EfficientPWConv(config[1], dec_planes[1])
         self.merge_enc_dec_l4 = EfficientPWConv(config[0], dec_planes[2])
-
+    
         self.bu_br_l2 = nn.Sequential(
             nn.BatchNorm2d(dec_planes[0]), nn.PReLU(dec_planes[0])
         )
@@ -91,7 +112,27 @@ class ESPNetv2Segmentation(nn.Module):
                 proj_planes=pyr_plane_proj,
                 out_planes=dec_planes[3],
                 last_layer_br=False,
+                normalize=False,
+                only_feat=True,
             )
+
+            if args.use_cosine:   
+                self.aux_classifier = ArcMarginProduct(
+                    in_features=self.dim_size,
+                    out_features=classes,
+                    s=args.cos_logit_scale,
+                    m=args.cos_margin,
+                    easy_margin=args.is_easy_margin,
+                )
+            else:
+                self.aux_classifier = nn.Conv2d(
+                    self.dim_size, 
+                    classes, 
+                    kernel_size=1, 
+                    stride=1, 
+                    bias=False
+                )
+
         else:
             print("Invalid value aux_layer = {}".format(aux_layer))
             raise ValueError
@@ -99,16 +140,17 @@ class ESPNetv2Segmentation(nn.Module):
         # self.upsample =  nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
 
         # Register 
-        self.activation = {}
-        def get_activation(name):
-            def hook(model, input, output):
-                self.activation[name] = output
+        # self.activation = {}
+        # def get_activation(name):
+        #     def hook(model, input, output):
+        #         self.activation[name] = output
 
-            return hook
+        #     return hook
 
-        self.bu_dec_l4.merge_layer[2].register_forward_hook(get_activation('output_main'))
-        self.aux_decoder.merge_layer[2].register_forward_hook(get_activation('output_aux'))
+        # self.bu_dec_l4.merge_layer[2].register_forward_hook(get_activation('output_main'))
+        # self.aux_decoder.merge_layer[2].register_forward_hook(get_activation('output_aux'))
 
+        self.use_cosine = args.use_cosine
         self.init_params()
 
     def upsample(self, x):
@@ -172,37 +214,83 @@ class ESPNetv2Segmentation(nn.Module):
                         if p.requires_grad:
                             yield p
 
-    def forward(self, x):
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        labels: Optional[torch.Tensor]=None,
+    ):
+        """Forward pass
+
+        Parameters
+        ----------
+        x: `torch.Tensor`
+            Input RGB image
+        labels: `torch.Tensor`
+            GT labels to calculate ArcFace scores
+
+        Returns
+        -------
+        A C-dimensional vector, C=# of classes
         """
-        :param x: Receives the input RGB image
-        :return: a C-dimensional vector, C=# of classes
-        """
-        x_size = (x.size(2), x.size(3))
+
+        x_size = (x.size(2), x.size(3))  # Width and height
+
+        #
+        # First conv
+        #
         enc_out_l1 = self.base_net.level1(x)  # 112
         if not self.base_net.input_reinforcement:
             del x
             x = None
 
+        #
+        # Second layer (Strided EESP)
+        #
         enc_out_l2 = self.base_net.level2_0(enc_out_l1, x)  # 56
 
-        enc_out_l3_0 = self.base_net.level3_0(enc_out_l2, x)  # down-sample
+        #
+        # Third layer 1 (Strided EESP)
+        #
+        enc_out_l3_0 = self.base_net.level3_0(enc_out_l2, x)  # down-sample -> 28
+
+        #
+        # EESP
+        #
         for i, layer in enumerate(self.base_net.level3):
             if i == 0:
                 enc_out_l3 = layer(enc_out_l3_0)
             else:
                 enc_out_l3 = layer(enc_out_l3)
 
-        enc_out_l4_0 = self.base_net.level4_0(enc_out_l3, x)  # down-sample
+        #
+        # Forth layer 1 (Strided EESP)
+        #
+        enc_out_l4_0 = self.base_net.level4_0(enc_out_l3, x)  # down-sample -> 14
+
+        #
+        # EESP
+        #
         for i, layer in enumerate(self.base_net.level4):
             if i == 0:
                 enc_out_l4 = layer(enc_out_l4_0)
+
             else:
                 enc_out_l4 = layer(enc_out_l4)
+
+        # *** 5th layer is for and classification and removed for segmentation ***
 
         # bottom-up decoding
         bu_out = self.bu_dec_l1(enc_out_l4)
         if self.aux_layer == 0:
             aux_out = self.aux_decoder(bu_out)
+
+            if self.use_cosine:
+                labels_interp = (
+                    self._downsample_label(labels, aux_out) if labels is not None else None
+                )
+                aux_logits = self.aux_classifier(aux_out, labels_interp)
+            else:
+                aux_logits = self.aux_classifier(aux_out,)
 
         # Decoding block
         bu_out = self.upsample(bu_out)
@@ -213,6 +301,14 @@ class ESPNetv2Segmentation(nn.Module):
         if self.aux_layer == 1:
             aux_out = self.aux_decoder(bu_out)
 
+            if self.use_cosine:
+                labels_interp = (
+                    self._downsample_label(labels, aux_out) if labels is not None else None
+                )
+                aux_logits = self.aux_classifier(aux_out, labels_interp)
+            else:
+                aux_logits = self.aux_classifier(aux_out,)
+
         # decoding block
         bu_out = self.upsample(bu_out)
         enc_out_l2_proj = self.merge_enc_dec_l3(enc_out_l2)
@@ -221,6 +317,14 @@ class ESPNetv2Segmentation(nn.Module):
         bu_out = self.bu_dec_l3(bu_out)
         if self.aux_layer == 2:
             aux_out = self.aux_decoder(bu_out)
+            if self.use_cosine:
+                labels_interp = (
+                    self._downsample_label(labels, aux_out) if labels is not None else None
+                )
+
+                aux_logits = self.aux_classifier(aux_out, labels_interp)
+            else:
+                aux_logits = self.aux_classifier(aux_out,)
 
         # decoding block
         bu_out = self.upsample(bu_out)
@@ -229,50 +333,50 @@ class ESPNetv2Segmentation(nn.Module):
         bu_out = self.bu_br_l4(bu_out)
         bu_out = self.bu_dec_l4(bu_out)
 
-        #
-        # Feature
-        #
-        main_feature = F.interpolate(self.activation['output_main'], size=x_size, mode='bilinear')
-        aux_feature = F.interpolate(self.activation['output_aux'], size=x_size, mode='bilinear')
+        if self.use_cosine:
+            labels_interp = (
+                self._downsample_label(labels, bu_out) if labels is not None else None
+            )
+            main_logits = self.main_classifier(bu_out, labels_interp)
+        else:
+            main_logits = self.main_classifier(bu_out,)
 
-        feature = torch.cat((main_feature, aux_feature), dim=1)
+        # Features
+        main_feat = F.interpolate(
+            F.normalize(bu_out), size=x_size, mode="bilinear", align_corners=True
+        )
+        aux_feat = F.interpolate(
+            F.normalize(aux_out), size=x_size, mode="bilinear", align_corners=True
+        )
 
         return {
             "out": F.interpolate(
-                bu_out, size=x_size, mode="bilinear", align_corners=True
+                main_logits, size=x_size, mode="bilinear", align_corners=True
             ),
             "aux": F.interpolate(
-                aux_out, size=x_size, mode="bilinear", align_corners=True
+                aux_logits, size=x_size, mode="bilinear", align_corners=True
             ),
-            "feat": feature,
+            "feat": torch.cat((main_feat, aux_feat), dim=1),
+            "main_feat": main_feat,
+            "aux_feat": aux_feat,
         }
 
 
-#        # bottom-up decoding
-#        bu_out = self.bu_dec_l1(enc_out_l4)
-#
-#        # Decoding block
-#        bu_out = self.upsample(bu_out)
-#        enc_out_l3_proj = self.merge_enc_dec_l2(enc_out_l3)
-#        bu_out = enc_out_l3_proj + bu_out
-#        bu_out = self.bu_br_l2(bu_out)
-#        bu_out = self.bu_dec_l2(bu_out)
-#
-#        # decoding block
-#        bu_out = self.upsample(bu_out)
-#        enc_out_l2_proj = self.merge_enc_dec_l3(enc_out_l2)
-#        bu_out = enc_out_l2_proj + bu_out
-#        bu_out = self.bu_br_l3(bu_out)
-#        bu_out = self.bu_dec_l3(bu_out)
-#
-#        # decoding block
-#        bu_out = self.upsample(bu_out)
-#        enc_out_l1_proj = self.merge_enc_dec_l4(enc_out_l1)
-#        bu_out = enc_out_l1_proj + bu_out
-#        bu_out = self.bu_br_l4(bu_out)
-#        bu_out = self.bu_dec_l4(bu_out)
-#
-#        return F.interpolate(bu_out, size=x_size, mode="bilinear", align_corners=True)
+    def _downsample_label(
+        self, 
+        labels: torch.Tensor, 
+        target: torch.Tensor,
+    ):
+        """Downsample the label to the size of 'target'"""
+        H, W = labels.size(1), labels.size(2)
+        h = target.size(2)
+        w = target.size(3)
+        ih = torch.linspace(0, H - 1, h).long()
+        iw = torch.linspace(0, W - 1, w).long()
+        labels_interp = labels[:, ih[:, None], iw]
+
+        return labels_interp
+
 
 
 def espnetv2_seg(args):
