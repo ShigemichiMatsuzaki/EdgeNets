@@ -66,15 +66,15 @@ class ESPNetv2Segmentation(nn.Module):
             out_planes=dec_planes[2],
         )
 
-        self.bu_dec_l4 = EfficientPyrPool(
-            in_planes=dec_planes[2],
-            proj_planes=pyr_plane_proj,
-            out_planes=dec_planes[3],
-            last_layer_br=False,
-            normalize=False,
-            only_feat=True,
-        )
         if args.use_cosine:   
+            self.bu_dec_l4 = EfficientPyrPool(
+                in_planes=dec_planes[2],
+                proj_planes=pyr_plane_proj,
+                out_planes=dec_planes[3],
+                last_layer_br=False,
+                normalize=False,
+                only_feat=True,
+            )
             self.main_classifier = ArcMarginProduct(
                 in_features=self.dim_size,
                 out_features=classes,
@@ -83,14 +83,13 @@ class ESPNetv2Segmentation(nn.Module):
                 easy_margin=args.is_easy_margin,
             )
         else:
-            self.main_classifier = nn.Conv2d(
-                self.dim_size, 
-                classes, 
-                kernel_size=1, 
-                stride=1, 
-                bias=False
+            self.bu_dec_l4 = EfficientPyrPool(
+                in_planes=dec_planes[2],
+                proj_planes=pyr_plane_proj,
+                out_planes=dec_planes[3],
+                last_layer_br=False,
             )
-    
+
         self.merge_enc_dec_l2 = EfficientPWConv(config[2], dec_planes[0])
         self.merge_enc_dec_l3 = EfficientPWConv(config[1], dec_planes[1])
         self.merge_enc_dec_l4 = EfficientPWConv(config[0], dec_planes[2])
@@ -107,16 +106,16 @@ class ESPNetv2Segmentation(nn.Module):
 
         if aux_layer >= 0 and aux_layer < 3:
             self.aux_layer = aux_layer
-            self.aux_decoder = EfficientPyrPool(
-                in_planes=dec_planes[aux_layer],
-                proj_planes=pyr_plane_proj,
-                out_planes=dec_planes[3],
-                last_layer_br=False,
-                normalize=False,
-                only_feat=True,
-            )
-
             if args.use_cosine:   
+                self.aux_decoder = EfficientPyrPool(
+                    in_planes=dec_planes[aux_layer],
+                    proj_planes=pyr_plane_proj,
+                    out_planes=dec_planes[3],
+                    last_layer_br=False,
+                    normalize=False,
+                    only_feat=True,
+                )
+
                 self.aux_classifier = ArcMarginProduct(
                     in_features=self.dim_size,
                     out_features=classes,
@@ -125,12 +124,11 @@ class ESPNetv2Segmentation(nn.Module):
                     easy_margin=args.is_easy_margin,
                 )
             else:
-                self.aux_classifier = nn.Conv2d(
-                    self.dim_size, 
-                    classes, 
-                    kernel_size=1, 
-                    stride=1, 
-                    bias=False
+                self.aux_decoder = EfficientPyrPool(
+                    in_planes=dec_planes[aux_layer],
+                    proj_planes=pyr_plane_proj,
+                    out_planes=dec_planes[3],
+                    last_layer_br=False,
                 )
 
         else:
@@ -140,15 +138,16 @@ class ESPNetv2Segmentation(nn.Module):
         # self.upsample =  nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
 
         # Register 
-        # self.activation = {}
-        # def get_activation(name):
-        #     def hook(model, input, output):
-        #         self.activation[name] = output
+        if not args.use_cosine:
+            self.activation = {}
+            def get_activation(name):
+                def hook(model, input, output):
+                    self.activation[name] = output
 
-        #     return hook
+                return hook
 
-        # self.bu_dec_l4.merge_layer[2].register_forward_hook(get_activation('output_main'))
-        # self.aux_decoder.merge_layer[2].register_forward_hook(get_activation('output_aux'))
+            self.bu_dec_l4.merge_layer[2].register_forward_hook(get_activation('output_main'))
+            self.aux_decoder.merge_layer[2].register_forward_hook(get_activation('output_aux'))
 
         self.use_cosine = args.use_cosine
         self.init_params()
@@ -282,15 +281,14 @@ class ESPNetv2Segmentation(nn.Module):
         # bottom-up decoding
         bu_out = self.bu_dec_l1(enc_out_l4)
         if self.aux_layer == 0:
-            aux_out = self.aux_decoder(bu_out)
-
             if self.use_cosine:
+                aux_out = self.aux_decoder(bu_out)
                 labels_interp = (
                     self._downsample_label(labels, aux_out) if labels is not None else None
                 )
                 aux_logits = self.aux_classifier(aux_out, labels_interp)
             else:
-                aux_logits = self.aux_classifier(aux_out,)
+                aux_logits = self.aux_decoder(bu_out,)
 
         # Decoding block
         bu_out = self.upsample(bu_out)
@@ -299,15 +297,14 @@ class ESPNetv2Segmentation(nn.Module):
         bu_out = self.bu_br_l2(bu_out)
         bu_out = self.bu_dec_l2(bu_out)
         if self.aux_layer == 1:
-            aux_out = self.aux_decoder(bu_out)
-
             if self.use_cosine:
+                aux_out = self.aux_decoder(bu_out)
                 labels_interp = (
                     self._downsample_label(labels, aux_out) if labels is not None else None
                 )
                 aux_logits = self.aux_classifier(aux_out, labels_interp)
             else:
-                aux_logits = self.aux_classifier(aux_out,)
+                aux_logits = self.aux_decoder(bu_out,)
 
         # decoding block
         bu_out = self.upsample(bu_out)
@@ -316,38 +313,44 @@ class ESPNetv2Segmentation(nn.Module):
         bu_out = self.bu_br_l3(bu_out)
         bu_out = self.bu_dec_l3(bu_out)
         if self.aux_layer == 2:
-            aux_out = self.aux_decoder(bu_out)
             if self.use_cosine:
+                aux_out = self.aux_decoder(bu_out)
                 labels_interp = (
                     self._downsample_label(labels, aux_out) if labels is not None else None
                 )
 
                 aux_logits = self.aux_classifier(aux_out, labels_interp)
             else:
-                aux_logits = self.aux_classifier(aux_out,)
+                aux_logits = self.aux_decoder(bu_out,)
 
         # decoding block
         bu_out = self.upsample(bu_out)
         enc_out_l1_proj = self.merge_enc_dec_l4(enc_out_l1)
         bu_out = enc_out_l1_proj + bu_out
         bu_out = self.bu_br_l4(bu_out)
-        bu_out = self.bu_dec_l4(bu_out)
 
         if self.use_cosine:
+            bu_out = self.bu_dec_l4(bu_out)
             labels_interp = (
                 self._downsample_label(labels, bu_out) if labels is not None else None
             )
             main_logits = self.main_classifier(bu_out, labels_interp)
         else:
-            main_logits = self.main_classifier(bu_out,)
+            main_logits = self.bu_dec_l4(bu_out,)
 
         # Features
-        main_feat = F.interpolate(
-            F.normalize(bu_out), size=x_size, mode="bilinear", align_corners=True
-        )
-        aux_feat = F.interpolate(
-            F.normalize(aux_out), size=x_size, mode="bilinear", align_corners=True
-        )
+        if self.use_cosine:
+            main_feat = F.interpolate(
+                F.normalize(bu_out), size=x_size, mode="bilinear", align_corners=True
+            )
+            aux_feat = F.interpolate(
+                F.normalize(aux_out), size=x_size, mode="bilinear", align_corners=True
+            )
+        else:
+            main_feat = F.interpolate(
+                self.activation['output_main'], size=x_size, mode="bilinear", align_corners=True)
+            aux_feat = F.interpolate(
+                self.activation['output_aux'], size=x_size, mode="bilinear", align_corners=True)
 
         return {
             "out": F.interpolate(
